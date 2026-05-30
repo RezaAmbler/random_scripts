@@ -29,22 +29,29 @@ By default the script only reports. Add `--delete` to plan removals — it keeps
 **dry run** (prints the plan + reclaimable space, deletes nothing):
 
 ```sh
-# Preview what would be removed, keeping the oldest copy of each (default)
+# 1) Preview, keeping the oldest copy of each (default). A reusable JSON plan
+#    is auto-saved (find_dupes_plan_<timestamp>.json) so you don't rescan later.
 python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --delete
 
-# Export a reviewable rm-script instead of deleting in-process
-python find_duplicates.py /share/... --delete --delete-script cleanup.sh
+# 2) Apply that exact plan WITHOUT re-scanning the whole tree again:
+python find_duplicates.py --from-plan find_dupes_plan_20260530_154635.json --apply --verify
 
-# Actually delete (prompts y/N first; --yes skips the prompt for cron)
+# Or: actually delete right after the scan (prompts y/N; --yes skips it)
 python find_duplicates.py /share/... --delete --apply
-python find_duplicates.py /share/... --delete --apply --yes --verify
+
+# Or: export a reviewable rm-script and run it yourself
+python find_duplicates.py /share/... --delete --delete-script cleanup.sh
 ```
 
 - `--keep {oldest,newest,shortest,first}` — which copy survives (default
   `oldest` by mtime; `shortest` = shortest path, `first` = first alphabetical).
-- `--apply` actually deletes (with a confirmation prompt unless `--yes`);
-  `--verify` re-hashes each file right before deleting and skips it if its
-  content changed since the scan.
+- **Plan reuse:** a dry run writes a JSON plan (override path with `--save-plan
+  FILE`, suppress with `--no-save-plan`). `--from-plan FILE` re-applies it with no
+  scan; add `--apply` to delete and `--verify` to re-hash first (recommended for
+  older plans). The rm-script (`--delete-script`) is the manual alternative — run
+  it with `sh`; it carries no hashes, so prefer `--from-plan` for safe re-apply.
+- `--apply` actually deletes (confirmation prompt unless `--yes`); `--verify`
+  re-hashes each file right before deleting and skips it if its content changed.
 - Safety: dry-run by default, one copy always kept, a missing survivor skips the
   whole group, and per-file errors are counted (not fatal). Hardlinks/symlinks
   are never split — the scan already de-dups by inode.

@@ -43,6 +43,7 @@ import os
 import sys
 import argparse
 import hashlib
+import json
 import time
 from collections import defaultdict
 
@@ -803,6 +804,93 @@ def apply_deletions(plan, verify=False, show_progress=True):
 
 
 # ============================================================================
+# Plan persistence (save a dry-run plan, re-apply it without re-scanning)
+# ============================================================================
+
+PLAN_VERSION = 1
+_PY2 = bytes is str  # On Python 2, filesystem paths are bytes (str).
+
+
+def _path_to_text(p):
+    """Filesystem path -> JSON-safe text. Lossless via latin-1 on Py2 bytes."""
+    if _PY2 and isinstance(p, bytes):
+        # latin-1 round-trips every byte; pure-ASCII names stay readable.
+        return p.decode('latin-1')
+    return p  # Python 3 paths from os.walk are already str
+
+
+def _text_to_path(s):
+    """JSON text -> filesystem path of the OS-native type."""
+    if _PY2 and isinstance(s, unicode):  # noqa: F821 (py2 only)
+        return s.encode('latin-1')
+    return s
+
+
+def save_plan(plan, filename, strategy, min_size):
+    """Serialize a deletion plan to JSON so --apply can reuse it without scanning."""
+    total_files = sum(len(item['deletes']) for item in plan)
+    total_reclaim = sum(item['size'] * len(item['deletes']) for item in plan)
+    data = {
+        'tool': 'find_duplicates.py',
+        'version': PLAN_VERSION,
+        'created': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'strategy': strategy,
+        'min_size': min_size,
+        'summary': {
+            'groups': len(plan),
+            'files_to_delete': total_files,
+            'reclaim_bytes': total_reclaim,
+        },
+        'groups': [
+            {
+                'hash': item['hash'],
+                'size': item['size'],
+                'keep': _path_to_text(item['keep']),
+                'deletes': [_path_to_text(p) for p in item['deletes']],
+            }
+            for item in plan
+        ],
+    }
+    text = json.dumps(data, indent=2)
+    # ensure_ascii (default) keeps the body ASCII; write bytes for Py2/Py3 parity.
+    with open(filename, 'wb') as f:
+        f.write(text if isinstance(text, bytes) else text.encode('utf-8'))
+
+
+def load_plan(filename):
+    """
+    Load a JSON plan. Returns (groups, metadata) where groups is the same shape
+    apply_deletions() expects ({'keep','deletes','size','hash'}) with OS-native
+    paths. Raises ValueError on a malformed/incompatible file.
+    """
+    with open(filename, 'rb') as f:
+        raw = f.read()
+    data = json.loads(raw.decode('utf-8'))
+
+    if not isinstance(data, dict) or data.get('tool') != 'find_duplicates.py':
+        raise ValueError("not a find_duplicates.py plan file")
+    if data.get('version') != PLAN_VERSION:
+        raise ValueError("unsupported plan version: {0}".format(data.get('version')))
+
+    groups = []
+    for g in data.get('groups', []):
+        keep = _text_to_path(g['keep'])
+        deletes = [_text_to_path(p) for p in g['deletes']]
+        if not deletes:
+            continue
+        groups.append({
+            'hash': g.get('hash', ''),
+            'size': int(g.get('size', 0)),
+            'keep': keep,
+            'deletes': deletes,
+        })
+    if not groups:
+        raise ValueError("plan contains no deletions")
+
+    return groups, data
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -821,8 +909,9 @@ Examples:
 
     parser.add_argument(
         'paths',
-        nargs='+',
-        help='One or more directory paths to scan'
+        nargs='*',
+        help='One or more directory paths to scan '
+             '(not required with --from-plan)'
     )
 
     parser.add_argument(
@@ -908,6 +997,23 @@ Examples:
         action='store_true',
         help='With --apply, skip the confirmation prompt (for cron/automation)'
     )
+    delete_group.add_argument(
+        '--save-plan',
+        metavar='FILE',
+        help='Write the deletion plan to FILE as JSON (default: auto-saved to a '
+             'timestamped file on a dry run, for reuse with --from-plan)'
+    )
+    delete_group.add_argument(
+        '--no-save-plan',
+        action='store_true',
+        help='Do not auto-save the JSON plan on a dry run'
+    )
+    delete_group.add_argument(
+        '--from-plan',
+        metavar='FILE',
+        help='Apply a previously-saved JSON plan WITHOUT re-scanning. Combine '
+             'with --apply to delete (and --verify is recommended for old plans)'
+    )
 
     return parser.parse_args()
 
@@ -915,6 +1021,11 @@ Examples:
 def main():
     """Main entry point."""
     args = parse_args()
+
+    # Apply a previously-saved plan without re-scanning, then we're done.
+    if args.from_plan:
+        apply_from_plan(args)
+        return
 
     # Validate paths
     valid_paths = []
@@ -926,7 +1037,8 @@ def main():
                   file=sys.stderr)
 
     if not valid_paths:
-        print("Error: No valid directories to scan.", file=sys.stderr)
+        print("Error: No valid directories to scan (or use --from-plan).",
+              file=sys.stderr)
         sys.exit(2)
 
     # Create finder and scan
@@ -969,17 +1081,44 @@ def main():
     sys.exit(0)
 
 
+def _default_plan_name():
+    """Timestamped default filename for an auto-saved dry-run plan."""
+    return "find_dupes_plan_{0}.json".format(time.strftime("%Y%m%d_%H%M%S"))
+
+
+def _confirm_and_apply(plan, args):
+    """Shared confirm + delete + summary for both fresh and from-plan applies."""
+    total_files = sum(len(item['deletes']) for item in plan)
+    total_reclaim = sum(item['size'] * len(item['deletes']) for item in plan)
+
+    if not args.yes:
+        prompt = "\nDelete {0} files, reclaiming {1}? [y/N] ".format(
+            total_files, human_readable_size(total_reclaim))
+        try:
+            answer = raw_input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ''
+        if answer not in ('y', 'yes'):
+            print("Aborted. Nothing deleted.")
+            return
+
+    stats = apply_deletions(plan, verify=args.verify,
+                            show_progress=not args.no_progress)
+    print("\nDeletion complete:")
+    print("  Deleted:   {0}".format(stats['deleted']))
+    print("  Failed:    {0}".format(stats['failed']))
+    print("  Reclaimed: {0} ({1})".format(
+        stats['reclaimed'], human_readable_size(stats['reclaimed'])))
+
+
 def run_deletion(duplicates, args):
-    """Build a deletion plan and either preview, export, or apply it."""
+    """Build a deletion plan and either preview (saving it), export, or apply it."""
     plan = plan_deletions(duplicates, args.keep)
     if not plan:
         print("\nNothing to delete (every group has only one copy).")
         return
 
     print(format_deletion_plan(plan, args.keep))
-
-    total_files = sum(len(item['deletes']) for item in plan)
-    total_reclaim = sum(item['size'] * len(item['deletes']) for item in plan)
 
     # Mode 1: export a reviewable rm-script (deletes nothing).
     if args.delete_script:
@@ -991,32 +1130,63 @@ def run_deletion(duplicates, args):
             print("Error writing script: {0}".format(e), file=sys.stderr)
         return
 
-    # Mode 2: actually delete.
+    # Mode 2: actually delete. Save the plan first if explicitly requested.
     if args.apply:
-        if not args.yes:
-            prompt = "\nDelete {0} files, reclaiming {1}? [y/N] ".format(
-                total_files, human_readable_size(total_reclaim))
+        if args.save_plan:
             try:
-                answer = raw_input(prompt).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = ''
-            if answer not in ('y', 'yes'):
-                print("Aborted. Nothing deleted.")
-                return
-
-        stats = apply_deletions(plan, verify=args.verify,
-                                show_progress=not args.no_progress)
-        print("\nDeletion complete:")
-        print("  Deleted:   {0}".format(stats['deleted']))
-        print("  Failed:    {0}".format(stats['failed']))
-        print("  Reclaimed: {0} ({1})".format(
-            stats['reclaimed'], human_readable_size(stats['reclaimed'])))
+                save_plan(plan, args.save_plan, args.keep, args.min_size)
+                print("\nPlan saved to: {0}".format(args.save_plan))
+            except (IOError, OSError) as e:
+                print("Warning: could not save plan: {0}".format(e), file=sys.stderr)
+        _confirm_and_apply(plan, args)
         return
 
-    # Mode 3: dry run (default).
+    # Mode 3: dry run — save the plan so --apply can reuse it without re-scanning.
+    plan_path = args.save_plan
+    if not plan_path and not args.no_save_plan:
+        plan_path = _default_plan_name()
+    if plan_path:
+        try:
+            save_plan(plan, plan_path, args.keep, args.min_size)
+            print("\nPlan saved to: {0}".format(plan_path))
+            print("Apply later WITHOUT re-scanning:")
+            print("  python find_duplicates.py --from-plan {0} --apply".format(
+                _shell_quote(plan_path)))
+        except (IOError, OSError) as e:
+            print("Warning: could not save plan: {0}".format(e), file=sys.stderr)
+
     print("\nDRY RUN — nothing deleted.")
-    print("Re-run with --apply to delete, or --delete-script FILE to export "
-          "an rm-script.")
+    print("Re-run with --apply to delete now, or --delete-script FILE for an rm-script.")
+
+
+def apply_from_plan(args):
+    """Load a saved JSON plan and preview or apply it, with no scanning."""
+    try:
+        groups, meta = load_plan(args.from_plan)
+    except (IOError, OSError) as e:
+        print("Error: cannot read plan {0}: {1}".format(args.from_plan, e),
+              file=sys.stderr)
+        sys.exit(2)
+    except ValueError as e:
+        print("Error: invalid plan {0}: {1}".format(args.from_plan, e),
+              file=sys.stderr)
+        sys.exit(2)
+
+    strategy = meta.get('strategy', '?')
+    created = meta.get('created', '?')
+    print("Loaded plan from {0} (created {1}, keep strategy: {2})".format(
+        args.from_plan, created, strategy))
+    print(format_deletion_plan(groups, strategy))
+
+    if not args.apply:
+        print("\nDRY RUN — nothing deleted. Re-run with --apply to delete.")
+        return
+
+    if not args.verify:
+        print("\nNote: applying a saved plan without --verify. If files may have "
+              "changed since the plan was made, re-run with --verify.",
+              file=sys.stderr)
+    _confirm_and_apply(groups, args)
 
 
 if __name__ == '__main__':
