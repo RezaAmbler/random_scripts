@@ -6,6 +6,7 @@ Queries multiple route servers to check BGP prefix visibility and AS paths.
 
 import argparse
 import asyncio
+import ipaddress
 import logging
 import re
 import sys
@@ -495,18 +496,26 @@ def create_sample_config(filename: str):
 async def run_concurrent_lookups_batch(prefixes: List[str], servers: List[Dict], debug: bool = False) -> Dict[str, List[BGPResult]]:
     """Run BGP lookups for multiple prefixes across all route servers"""
     client = RouteServerClient(debug=debug)
-    
+
     # Group tasks by server to avoid overwhelming any single server
     all_results = {}
-    
+
+    total = len(prefixes)
+    start = time.time()
     if debug:
-        print(f"DEBUG: Processing {len(prefixes)} prefixes across {len(servers)} servers...")
-    
+        print(f"DEBUG: Processing {total} prefixes across {len(servers)} servers...")
+
     for i, prefix in enumerate(prefixes, 1):
-        if len(prefixes) > 1:
-            print(f"Querying prefix {i}/{len(prefixes)}: {prefix}")
-        
+        elapsed = time.time() - start
+        # Progress: prefix position, server count, and elapsed time.
+        print(f"[{i}/{total}] Querying {prefix} across {len(servers)} server(s) "
+              f"({elapsed:.0f}s elapsed)")
+
+        # Keep tasks and their owning servers in lockstep — skipped servers
+        # (unknown access type) must not shift the index used to attribute
+        # exceptions back to a server below.
         tasks = []
+        task_servers = []
         for server in servers:
             if server['access'].lower() == 'telnet':
                 task = client.query_telnet(server, prefix)
@@ -516,34 +525,37 @@ async def run_concurrent_lookups_batch(prefixes: List[str], servers: List[Dict],
                 if debug:
                     print(f"Warning: Unknown access type '{server['access']}' for {server['name']}")
                 continue
-            
+
             tasks.append(task)
-        
+            task_servers.append(server)
+
         if not tasks:
             print("No valid route servers configured.")
             continue
-        
+
         # Run queries for this prefix
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         # Handle any exceptions that occurred
         clean_results = []
         for j, result in enumerate(results):
             if isinstance(result, Exception):
                 clean_results.append(BGPResult(
-                    server_name=servers[j]['name'],
+                    server_name=task_servers[j]['name'],
                     success=False,
                     error=f"Query exception: {str(result)}"
                 ))
             else:
                 clean_results.append(result)
-        
+
         all_results[prefix] = clean_results
-        
+
         # Small delay between prefixes to be respectful to route servers
-        if i < len(prefixes):
+        if i < total:
             await asyncio.sleep(1)
-    
+
+    print(f"Completed {total} prefix(es) across {len(servers)} server(s) "
+          f"in {time.time() - start:.0f}s")
     return all_results
 
 
@@ -907,10 +919,23 @@ def save_batch_results(summary: Dict, prefixes: List[str], filename: str, detail
         print(f"Error saving results: {e}")
 
 
+def is_valid_prefix(value: str) -> bool:
+    """True if value is a valid IP address or CIDR network (v4 or v6)."""
+    try:
+        ipaddress.ip_network(value, strict=False)
+        return True
+    except ValueError:
+        try:
+            ipaddress.ip_address(value)
+            return True
+        except ValueError:
+            return False
+
+
 def get_prefix_input(args) -> List[str]:
     """Get prefix(es) from command line args, file, or user input"""
     prefixes = []
-    
+
     # Check for file input first
     if args.file:
         try:
@@ -918,36 +943,37 @@ def get_prefix_input(args) -> List[str]:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
                     if line and not line.startswith('#'):  # Skip empty lines and comments
-                        # Basic validation
-                        if '/' in line or '.' in line:
+                        if is_valid_prefix(line):
                             prefixes.append(line)
                         else:
                             print(f"Warning: Skipping invalid prefix on line {line_num}: {line}")
-            
+
             if not prefixes:
                 print(f"Error: No valid prefixes found in file {args.file}")
                 sys.exit(1)
-                
+
             print(f"Loaded {len(prefixes)} prefixes from {args.file}")
             return prefixes
-            
+
         except FileNotFoundError:
             print(f"Error: File {args.file} not found")
             sys.exit(1)
         except Exception as e:
             print(f"Error reading file {args.file}: {e}")
             sys.exit(1)
-    
+
     # Single prefix from command line
     if args.prefix:
+        if not is_valid_prefix(args.prefix):
+            print(f"Error: '{args.prefix}' is not a valid IP prefix")
+            sys.exit(1)
         return [args.prefix]
-    
+
     # Interactive input for single prefix
     while True:
         prefix = input("Enter prefix to look up (e.g., 1.2.3.0/24): ").strip()
         if prefix:
-            # Basic validation
-            if '/' in prefix or '.' in prefix:
+            if is_valid_prefix(prefix):
                 return [prefix]
             else:
                 print("Please enter a valid IP prefix (e.g., 192.168.1.0/24)")
