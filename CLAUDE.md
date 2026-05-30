@@ -14,6 +14,8 @@ Current categories (extend as needed):
 | Folder        | Purpose                                              |
 |---------------|------------------------------------------------------|
 | `qnap/`       | Scripts for the QNAP NAS (maintenance, file ops)     |
+| `network/`    | Networking and routing diagnostics                   |
+| `dns/`        | DNS administration                                   |
 
 When adding a category, pick a short, lowercase, descriptive folder name
 (e.g. `media/`, `backup/`, `network/`, `git/`, `macos/`).
