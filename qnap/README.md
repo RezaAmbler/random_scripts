@@ -22,3 +22,29 @@ Exit codes: `0` = no duplicates (or `--zero-exit`), `1` = duplicates found
 (handy as a cron signal), `2` = no valid paths. See the script's header docstring
 for the full option list (`--min-size`, `--include-metadata`, `--follow-symlinks`,
 `--verbose`, `--no-progress`).
+
+#### Deleting duplicates
+By default the script only reports. Add `--delete` to plan removals — it keeps
+**one** copy per group and never deletes the last copy. `--delete` alone is a
+**dry run** (prints the plan + reclaimable space, deletes nothing):
+
+```sh
+# Preview what would be removed, keeping the oldest copy of each (default)
+python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --delete
+
+# Export a reviewable rm-script instead of deleting in-process
+python find_duplicates.py /share/... --delete --delete-script cleanup.sh
+
+# Actually delete (prompts y/N first; --yes skips the prompt for cron)
+python find_duplicates.py /share/... --delete --apply
+python find_duplicates.py /share/... --delete --apply --yes --verify
+```
+
+- `--keep {oldest,newest,shortest,first}` — which copy survives (default
+  `oldest` by mtime; `shortest` = shortest path, `first` = first alphabetical).
+- `--apply` actually deletes (with a confirmation prompt unless `--yes`);
+  `--verify` re-hashes each file right before deleting and skips it if its
+  content changed since the scan.
+- Safety: dry-run by default, one copy always kept, a missing survivor skips the
+  whole group, and per-file errors are counted (not fatal). Hardlinks/symlinks
+  are never split — the scan already de-dups by inode.
