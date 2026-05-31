@@ -232,15 +232,23 @@ class DuplicateFinder(object):
         self.files_skipped_inode = 0
         self.dirs_scanned = 0
         self.dirs_skipped = 0
+        self._candidates_collected = 0
 
-        # Phase 1: Group files by size
+        # Phase 1 runs in two passes (see scan_directories). The first pass
+        # only tallies a {size: count} table; the second keeps paths for the
+        # size-colliding files alone. size_groups therefore holds just the
+        # duplicate candidates, not every file scanned -- so peak memory
+        # scales with the number of collisions, not the total file count.
         # {size_in_bytes: [filepath1, filepath2, ...]}
         self.size_groups = defaultdict(list)
+        self.unique_sizes = 0  # distinct file sizes seen (for the summary)
 
         # (st_dev, st_ino) pairs already recorded. This makes the scan
         # idempotent across overlapping input paths (e.g. /a and /a/b given
         # together) and prevents hardlinks to the same inode from being
         # reported as reclaimable duplicates -- deleting one frees nothing.
+        # Reset between the two passes: pass 1 dedups for the tally, pass 2
+        # dedups again while collecting paths.
         self._seen_inodes = set()
 
     def log(self, message):
@@ -249,48 +257,91 @@ class DuplicateFinder(object):
             self.progress.clear()
             print(message, file=sys.stderr)
 
-    def _update_scan_progress(self, current_dir):
-        """Update the scanning progress display."""
-        # Shorten directory path for display
-        display_dir = current_dir
-        if len(display_dir) > 40:
-            display_dir = '...' + display_dir[-37:]
+    @staticmethod
+    def _shorten_dir(path, width=40):
+        """Trim a directory path to its tail for a fixed-width display."""
+        if len(path) > width:
+            return '...' + path[-(width - 3):]
+        return path
 
-        msg = "[Scan] Files: {0} | Size: {1} | Dirs: {2} | {3}".format(
+    def _update_scan_progress(self, current_dir):
+        """Update the pass-1 (size tally) progress display."""
+        msg = "[Scan 1/2] Files: {0} | Size: {1} | Dirs: {2} | {3}".format(
             self.total_files_scanned,
             human_readable_size(self.total_bytes_scanned),
             self.dirs_scanned,
-            display_dir
+            self._shorten_dir(current_dir)
         )
         self.progress.update(msg)
 
-    def scan_directories(self, paths):
-        """
-        Scan one or more directory paths for files.
+    def _update_collect_progress(self, current_dir, collected):
+        """Update the pass-2 (path collection) progress display."""
+        msg = "[Scan 2/2] Candidates: {0} | {1}".format(
+            collected,
+            self._shorten_dir(current_dir)
+        )
+        self.progress.update(msg)
 
-        Phase 1: Groups all files by size.
-        """
+    def _valid_paths(self, paths):
+        """Filter to existing directories, warning about the rest (once)."""
+        valid = []
         for base_path in paths:
             if not os.path.exists(base_path):
                 self.progress.clear()
                 print("Warning: Path does not exist: {0}".format(base_path),
                       file=sys.stderr)
                 continue
-
             if not os.path.isdir(base_path):
                 self.progress.clear()
                 print("Warning: Not a directory: {0}".format(base_path),
                       file=sys.stderr)
                 continue
+            valid.append(base_path)
+        return valid
 
-            self.log("Scanning: {0}".format(base_path))
-            self._scan_directory(base_path)
+    def scan_directories(self, paths):
+        """
+        Scan one or more directory paths for files in two passes.
 
-        # Clear progress line when done
+        Pass 1 tallies how many files share each exact byte size, keeping only
+        a {size: count} table -- no path strings. Pass 2 re-walks the same
+        paths and retains paths solely for the sizes that occurred more than
+        once -- the only files that could possibly be duplicates.
+
+        Splitting the walk this way keeps peak memory proportional to the
+        number of size-colliding files instead of the total file count, which
+        matters on a NAS with limited RAM and very large trees. The cost is a
+        second metadata (stat) walk, which is cheap next to the hashing phase
+        that follows.
+        """
+        valid_paths = self._valid_paths(paths)
+
+        # --- Pass 1: count files per size ---------------------------------
+        size_counts = defaultdict(int)
+        for base_path in valid_paths:
+            self.log("Scanning (pass 1/2): {0}".format(base_path))
+            self._count_sizes(base_path, size_counts)
         self.progress.clear()
 
-    def _scan_directory(self, base_path):
-        """Recursively scan a single directory."""
+        self.unique_sizes = len(size_counts)
+        candidate_sizes = set(size for size, n in size_counts.items() if n > 1)
+
+        # Free the pass-1 working set before pass 2 builds its own.
+        size_counts = None
+        self._seen_inodes = set()
+
+        if not candidate_sizes:
+            return
+
+        # --- Pass 2: collect paths for colliding sizes only ---------------
+        self._candidates_collected = 0
+        for base_path in valid_paths:
+            self.log("Scanning (pass 2/2): {0}".format(base_path))
+            self._collect_paths(base_path, candidate_sizes)
+        self.progress.clear()
+
+    def _count_sizes(self, base_path, size_counts):
+        """Pass 1: tally a {size: count} table; store no path strings."""
         for root, dirs, files in os.walk(base_path,
                                           followlinks=self.follow_symlinks):
             self.dirs_scanned += 1
@@ -302,7 +353,6 @@ class DuplicateFinder(object):
                        if not should_skip_dir(d, self.include_metadata)]
             self.dirs_skipped += original_dir_count - len(dirs)
 
-            # Process files
             for filename in files:
                 filepath = os.path.join(root, filename)
 
@@ -311,7 +361,6 @@ class DuplicateFinder(object):
                     continue
 
                 try:
-                    # Get file size
                     stat_info = os.stat(filepath)
                     file_size = stat_info.st_size
 
@@ -331,19 +380,62 @@ class DuplicateFinder(object):
                             continue
                         self._seen_inodes.add(inode_key)
 
-                    # Track statistics
                     self.total_files_scanned += 1
                     self.total_bytes_scanned += file_size
+                    size_counts[file_size] += 1
 
-                    # Group by size
-                    self.size_groups[file_size].append(filepath)
-
-                    # Update progress periodically
                     if self.total_files_scanned % 50 == 0:
                         self._update_scan_progress(root)
 
                 except (OSError, IOError):
                     self.files_skipped_error += 1
+
+    def _collect_paths(self, base_path, candidate_sizes):
+        """
+        Pass 2: walk again and keep paths only for sizes that occurred more
+        than once in pass 1. Inode de-duplication is repeated here (against a
+        fresh set) so hardlinks and overlapping inputs still collapse to a
+        single path -- consistently with the pass-1 tally.
+        """
+        seen = self._seen_inodes
+        for root, dirs, files in os.walk(base_path,
+                                         followlinks=self.follow_symlinks):
+            self._update_collect_progress(root, self._candidates_collected)
+
+            dirs[:] = [d for d in dirs
+                       if not should_skip_dir(d, self.include_metadata)]
+
+            for filename in files:
+                filepath = os.path.join(root, filename)
+
+                if not self.follow_symlinks and os.path.islink(filepath):
+                    continue
+
+                try:
+                    stat_info = os.stat(filepath)
+                    file_size = stat_info.st_size
+
+                    # Only files whose size collided in pass 1 can be dupes.
+                    if file_size not in candidate_sizes:
+                        continue
+
+                    if stat_info.st_ino != 0:
+                        inode_key = (stat_info.st_dev, stat_info.st_ino)
+                        if inode_key in seen:
+                            continue
+                        seen.add(inode_key)
+
+                    self.size_groups[file_size].append(filepath)
+                    self._candidates_collected += 1
+
+                    if self._candidates_collected % 50 == 0:
+                        self._update_collect_progress(
+                            root, self._candidates_collected)
+
+                except (OSError, IOError):
+                    # A file that errors here simply isn't collected; if it was
+                    # countable in pass 1 its group just loses one candidate.
+                    pass
 
     def find_duplicates(self):
         """
@@ -381,7 +473,7 @@ class DuplicateFinder(object):
         print("-" * 50)
         print("SCAN COMPLETE - CHECKSUM PHASE STARTING")
         print("-" * 50)
-        print("  Unique file sizes found:    {0}".format(len(self.size_groups)))
+        print("  Unique file sizes found:    {0}".format(self.unique_sizes))
         print("  Size groups with 2+ files:  {0}".format(len(size_groups_to_check)))
         print("  Candidate files (max):      {0}".format(upper_bound_files))
         print("  Data to read (max):         {0}".format(
