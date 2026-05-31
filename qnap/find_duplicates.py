@@ -19,7 +19,8 @@ USAGE EXAMPLES:
     # Change minimum file size (default 1MB)
     python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --min-size 10485760
 
-    # Speed up hashing on an idle multi-disk array (default 4 threads)
+    # Hashing uses 1 thread by default (best for spinning-disk RAID); bump it
+    # only on SSD/NVMe arrays where parallel sequential reads actually help
     python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --workers 8
 
     # Speed up the directory scan itself (parallel stat walk, default 8 threads)
@@ -69,6 +70,19 @@ try:
     raw_input
 except NameError:
     raw_input = input
+
+# dict.iteritems() (a lazy iterator) exists only on Python 2; on Python 3 the
+# plain .items() view is already lazy. This helper picks the right one so large
+# dicts (e.g. the per-size tally) are iterated without materialising a list on
+# Py2, while keeping the off-NAS Py3 test path working.
+try:
+    dict.iteritems
+
+    def _iteritems(d):
+        return d.iteritems()
+except AttributeError:
+    def _iteritems(d):
+        return d.items()
 
 # ============================================================================
 # Constants
@@ -245,7 +259,10 @@ class DuplicateFinder(object):
     def __init__(self, min_size=DEFAULT_MIN_SIZE, include_metadata=False,
                  follow_symlinks=False, verbose=False, show_progress=True,
                  workers=1, scan_workers=8):
-        self.min_size = min_size
+        # Floor at 1 byte: zero-byte files reclaim nothing if deleted and are
+        # often structural touch-files, so never group/delete them even if the
+        # caller passes --min-size 0.
+        self.min_size = max(1, min_size)
         self.include_metadata = include_metadata
         self.follow_symlinks = follow_symlinks
         self.verbose = verbose
@@ -279,12 +296,13 @@ class DuplicateFinder(object):
         self.size_groups = defaultdict(list)
         self.unique_sizes = 0  # distinct file sizes seen (for the summary)
 
-        # (st_dev, st_ino) pairs already recorded. This makes the scan
-        # idempotent across overlapping input paths (e.g. /a and /a/b given
-        # together) and prevents hardlinks to the same inode from being
-        # reported as reclaimable duplicates -- deleting one frees nothing.
-        # Reset between passes: pass 1 dedups for the tally, pass 2 dedups
-        # again while collecting paths.
+        # (st_dev, st_ino) pairs already recorded, so hardlinks to the same
+        # inode aren't reported as reclaimable duplicates (deleting one frees
+        # nothing). Reset between passes. Pass 1 only adds true hardlinks
+        # (nlink > 1) to keep this bounded by hardlink count on huge trees;
+        # pass 2 adds every inode (it's the pass that decides what's collected),
+        # which also makes the final result idempotent across overlapping input
+        # paths (e.g. /a and /a/b given together).
         self._seen_inodes = set()
 
     def log(self, message):
@@ -358,6 +376,12 @@ class DuplicateFinder(object):
         file reachable by several paths (hardlinks, or symlinks under
         --follow-symlinks) is represented by its lexicographically smallest
         path (see pass 2 below).
+
+        Pass 1 only de-dups true hardlinks (nlink > 1) to bound its inode set by
+        hardlink count, so its scan stats may double-count a non-hardlinked file
+        reached via overlapping input paths. Pass 2 de-dups on every inode, so
+        the collected candidate set -- and thus the final result -- is correct
+        regardless.
         """
         valid_paths = self._valid_paths(paths)
 
@@ -372,13 +396,20 @@ class DuplicateFinder(object):
             self.dirs_scanned += 1
             self.dirs_skipped += dirs_skipped
             self.files_skipped_error += errors
-            for filepath, file_size, inode_key in file_entries:
+            for filepath, file_size, inode_key, nlink in file_entries:
                 if file_size < self.min_size:
                     self.files_skipped_size += 1
                     continue
-                # Inode de-dup: decided here (under the lock) so concurrent
-                # workers can't both record the same inode.
-                if inode_key is not None:
+                # Inode de-dup, only for true hardlinks (nlink > 1). Decided
+                # here (under the lock) so concurrent workers can't both record
+                # the same inode. nlink == 1 files are NOT tracked -- that keeps
+                # this set proportional to hardlink count rather than total file
+                # count (a big RAM win on multi-million-file trees). The cost is
+                # purely in the stats: a nlink == 1 file reachable via overlapping
+                # input paths may be tallied twice here, inflating its size count.
+                # That only ever turns a unique size into a spurious candidate;
+                # pass 2 keeps full inode dedup, so the final result is unchanged.
+                if inode_key is not None and nlink > 1:
                     if inode_key in self._seen_inodes:
                         self.files_skipped_inode += 1
                         continue
@@ -394,7 +425,7 @@ class DuplicateFinder(object):
         self.scan_pass1_seconds = t_pass1 - t0
 
         self.unique_sizes = len(size_counts)
-        candidate_sizes = set(size for size, n in size_counts.items() if n > 1)
+        candidate_sizes = set(size for size, n in _iteritems(size_counts) if n > 1)
 
         # Free the pass-1 working set before pass 2 builds its own.
         size_counts = None
@@ -418,7 +449,11 @@ class DuplicateFinder(object):
             # Runs under the walk lock. Deliberately does NOT touch the pass-1
             # counters (dirs_scanned, files_skipped_*, total_*) -- those were
             # finalised in pass 1; re-counting here would double them.
-            for filepath, file_size, inode_key in file_entries:
+            # Full inode dedup here (every inode_key, not just nlink > 1): this
+            # is the pass that decides what gets collected/deleted, so it must
+            # collapse hardlinks AND files reached via overlapping input paths.
+            # The set stays small -- it's bounded by candidate-size files only.
+            for filepath, file_size, inode_key, _nlink in file_entries:
                 if file_size not in candidate_sizes:
                     continue
                 if inode_key is None:
@@ -472,8 +507,11 @@ class DuplicateFinder(object):
         entries WITHOUT holding any lock (this is the seek-bound part we want to
         overlap), then calls merge_batch(dirpath, file_entries, dirs_skipped,
         errors) once for that directory while holding a single shared lock.
-        file_entries is a list of (filepath, size, inode_key) where inode_key is
-        (st_dev, st_ino) or None when the fs reports no usable inode.
+        file_entries is a list of (filepath, size, inode_key, nlink) where
+        inode_key is (st_dev, st_ino) or None when the fs reports no usable
+        inode, and nlink is the target's link count (pass 1 uses it to track
+        only true hardlinks; pass 2 dedups on inode_key regardless). Only
+        regular files are listed -- fifos/sockets/device nodes are skipped.
 
         Subdirectories discovered are pushed back onto the queue, so the work
         set grows as the walk descends. Termination therefore relies on
@@ -545,12 +583,18 @@ class DuplicateFinder(object):
                         subdirs.append(full)
                     continue
 
-                # Regular file (or followed symlink to a non-dir, or a
-                # fifo/socket/device -- os.walk listed those as files too).
+                # Only regular files (or a followed symlink whose target is a
+                # regular file) are hashable. Skip fifos/sockets/device nodes:
+                # the old os.walk listed them as files, but compute_md5 would
+                # block forever on a fifo and read unbounded data from a device.
+                if not stat.S_ISREG(mode):
+                    continue
                 inode_key = None
                 if st.st_ino != 0:
                     inode_key = (st.st_dev, st.st_ino)
-                file_entries.append((full, st.st_size, inode_key))
+                # nlink lets pass 1 keep only true hardlinks (nlink > 1) in its
+                # inode set; pass 2 dedups on inode_key regardless (see merges).
+                file_entries.append((full, st.st_size, inode_key, st.st_nlink))
 
             with lock:
                 merge_batch(dirpath, file_entries, dirs_skipped, errors)
@@ -594,7 +638,8 @@ class DuplicateFinder(object):
             work.put(sentinel)           # wake the blocked workers so they exit
         self._await_threads(threads)
 
-    def _parallel_hash(self, filepaths, hash_fn, label, worker_count=None):
+    def _parallel_hash(self, filepaths, hash_fn, label, worker_count=None,
+                       show_byte_progress=False):
         """
         Hash every path in `filepaths` with a pool of `worker_count` threads
         (default self.workers).
@@ -632,7 +677,23 @@ class DuplicateFinder(object):
                     fp = work.get_nowait()
                 except Empty:
                     return
-                digest = hash_fn(fp)
+                name = os.path.basename(fp)
+                if len(name) > 30:
+                    name = name[:27] + '...'
+                # With show_byte_progress, feed a per-chunk callback into hash_fn
+                # so a single multi-GB hash ticks a percentage instead of looking
+                # stalled between completed files. The callback takes the same
+                # lock that guards the progress line; ProgressDisplay's 0.1s
+                # throttle keeps the per-chunk cost negligible.
+                if show_byte_progress:
+                    def cb(read, size, _name=name):
+                        pct = (read * 100 // size) if size else 100
+                        with lock:
+                            self.progress.update("{0} {1}/{2} | {3} ({4}%)".format(
+                                label, state['done'] + 1, total, _name, pct))
+                    digest = hash_fn(fp, progress_callback=cb)
+                else:
+                    digest = hash_fn(fp)
                 # Guard shared state AND the progress line (ProgressDisplay is
                 # not thread-safe); the write is throttled so this is cheap.
                 with lock:
@@ -641,9 +702,6 @@ class DuplicateFinder(object):
                         state['errors'] += 1
                     else:
                         results[fp] = digest
-                    name = os.path.basename(fp)
-                    if len(name) > 30:
-                        name = name[:27] + '...'
                     self.progress.update("{0} {1}/{2} | {3}".format(
                         label, state['done'], total, name))
 
@@ -676,7 +734,7 @@ class DuplicateFinder(object):
 
         # Only process size groups with more than one file
         size_groups_to_check = [
-            (size, files) for size, files in self.size_groups.items()
+            (size, files) for size, files in _iteritems(self.size_groups)
             if len(files) > 1
         ]
 
@@ -783,7 +841,8 @@ class DuplicateFinder(object):
             full_targets.extend(filepaths)
 
         t_h0 = time.time()
-        full_hashes = self._parallel_hash(full_targets, compute_md5, "[Hash]")
+        full_hashes = self._parallel_hash(full_targets, compute_md5, "[Hash]",
+                                          show_byte_progress=True)
         self.hash_seconds = time.time() - t_h0
 
         for size, filepaths in candidate_groups:
@@ -794,7 +853,7 @@ class DuplicateFinder(object):
                     hash_groups[digest].append(fp)
 
             # Collect groups with actual duplicates
-            for file_hash, fps in hash_groups.items():
+            for file_hash, fps in _iteritems(hash_groups):
                 if len(fps) > 1:
                     duplicates.append({
                         'hash': file_hash,
@@ -867,6 +926,9 @@ def format_report(finder, duplicates):
     lines.append("  Total duplicate files:  {0}".format(total_dup_files))
     lines.append("  Wasted space:           {0} ({1})".format(
         total_wasted, human_readable_size(total_wasted)))
+    lines.append("  Note: on ZFS (QuTS hero) or btrfs reflinks, identical files")
+    lines.append("        may already share blocks, so actual reclaimable space")
+    lines.append("        can be lower than shown.")
     lines.append("")
 
     # Detailed duplicate listing
@@ -900,9 +962,11 @@ def print_report(report_text, output_file=None):
         try:
             # Binary mode: paths are opaque bytes (possibly non-ASCII media
             # filenames), so write them through verbatim without inviting any
-            # implicit codec into the path.
+            # implicit codec into the path. On Py3 report_text is already text,
+            # so encode it (matches save_plan/write_delete_script).
             with open(output_file, 'wb') as f:
-                f.write(report_text)
+                f.write(report_text.encode('utf-8')
+                        if isinstance(report_text, type(u'')) else report_text)
             print("")
             print("Report saved to: {0}".format(output_file))
         except (IOError, OSError) as e:
@@ -913,12 +977,19 @@ def print_report(report_text, output_file=None):
 # Deletion
 # ============================================================================
 
-def _safe_mtime(path):
-    """Modification time, or +inf if it can't be read (so it's never 'oldest')."""
+def _safe_mtime(path, on_error=float('inf')):
+    """
+    Modification time, or `on_error` if it can't be read.
+
+    The sentinel is direction-aware: the 'oldest' branch passes +inf so an
+    unreadable file is never the minimum, and the 'newest' branch passes -inf
+    so it's never the maximum. Either way an unreadable file is never chosen as
+    the survivor (every readable copy is preferred), which is the safe default.
+    """
     try:
         return os.path.getmtime(path)
     except (OSError, IOError):
-        return float('inf')
+        return on_error
 
 
 def select_survivor(dup, strategy):
@@ -945,7 +1016,8 @@ def select_survivor(dup, strategy):
     elif strategy == 'shortest':
         keep = min(files, key=lambda p: (len(p), p))
     elif strategy == 'newest':
-        keep = max(files, key=lambda p: (_safe_mtime(p), -len(p)))
+        # -inf so an unreadable mtime sorts as oldest, never the kept maximum.
+        keep = max(files, key=lambda p: (_safe_mtime(p, float('-inf')), -len(p)))
     else:  # 'oldest' (default)
         keep = min(files, key=lambda p: (_safe_mtime(p), len(p)))
 
@@ -1004,6 +1076,8 @@ def format_deletion_plan(plan, strategy):
     lines.append("Files to delete:        {0}".format(total_files))
     lines.append("Space to reclaim:       {0} ({1})".format(
         total_reclaim, human_readable_size(total_reclaim)))
+    lines.append("(On ZFS/QuTS hero or btrfs reflinks, copies may already share")
+    lines.append(" blocks, so actual reclaimed space can be lower.)")
     lines.append("-" * 70)
     return "\n".join(lines)
 
@@ -1177,6 +1251,10 @@ def load_plan(filename):
     for g in data.get('groups', []):
         keep = _text_to_path(g['keep'])
         deletes = [_text_to_path(p) for p in g['deletes']]
+        # Defensive: a hand-edited plan must never list the survivor among the
+        # deletes (that would delete the only copy). Drop it, then skip the
+        # group if nothing is left to delete.
+        deletes = [p for p in deletes if p != keep]
         if not deletes:
             continue
         groups.append({
@@ -1232,12 +1310,13 @@ Examples:
     parser.add_argument(
         '-j', '--workers',
         type=int,
-        default=4,
+        default=1,
         metavar='N',
-        help='Number of parallel hashing threads (default: 4). Hashing is '
-             'I/O-bound; on an idle multi-disk array, 4-8 overlaps seek '
-             'latency and speeds things up. Use 1 for a single spinning disk '
-             'where parallel reads cause seek thrashing.'
+        help='Number of parallel hashing threads (default: 1). The full-hash '
+             'phase does large sequential reads, and on a spinning-disk array '
+             '(e.g. HDD RAID-6) a single reader already saturates it -- more '
+             'threads just cause seek thrashing and go slower. Bump it (2-8) '
+             'only on SSD/NVMe arrays or other setups where parallel reads help.'
     )
 
     parser.add_argument(
@@ -1347,8 +1426,12 @@ def main():
 
     # Apply a previously-saved plan without re-scanning, then we're done.
     if args.from_plan:
-        apply_from_plan(args)
-        return
+        stats = apply_from_plan(args)
+        # Exit 1 only if an apply actually ran and some deletions failed;
+        # a dry-run preview or a clean apply exits 0 (good for cron).
+        if stats is not None and stats['failed']:
+            sys.exit(1)
+        sys.exit(0)
 
     # Validate paths
     valid_paths = []
@@ -1363,6 +1446,10 @@ def main():
         print("Error: No valid directories to scan (or use --from-plan).",
               file=sys.stderr)
         sys.exit(2)
+
+    if args.min_size < 1:
+        print("Note: --min-size below 1 byte is treated as 1; zero-byte files "
+              "are always skipped.", file=sys.stderr)
 
     # Create finder and scan
     finder = DuplicateFinder(
@@ -1394,13 +1481,19 @@ def main():
     print_report(report, args.output)
 
     # Phase 3 (optional): deletion
+    applied = None
     if args.delete and duplicates:
-        run_deletion(duplicates, args)
+        applied = run_deletion(duplicates, args)
 
     # Exit code:
-    #   0 = no duplicates found (or --zero-exit given)
-    #   1 = duplicates found (useful as a cron/script signal)
+    #   0 = no duplicates found (or --zero-exit), or a deletion completed cleanly
+    #   1 = duplicates found on a scan-only run, or some deletions failed
     #   2 = usage error (no valid paths) -- handled above
+    # When --apply actually deleted, the exit code reflects the apply result
+    # (so a successful cron delete reads as success) rather than the mere
+    # presence of duplicates.
+    if applied is not None:
+        sys.exit(1 if applied['failed'] else 0)
     if duplicates and not args.zero_exit:
         sys.exit(1)
     sys.exit(0)
@@ -1408,11 +1501,20 @@ def main():
 
 def _default_plan_name():
     """Timestamped default filename for an auto-saved dry-run plan."""
-    return "find_dupes_plan_{0}.json".format(time.strftime("%Y%m%d_%H%M%S"))
+    # Include the PID so two runs in the same second don't collide (strftime
+    # has only 1s granularity).
+    return "find_dupes_plan_{0}_{1}.json".format(
+        time.strftime("%Y%m%d_%H%M%S"), os.getpid())
 
 
 def _confirm_and_apply(plan, args):
-    """Shared confirm + delete + summary for both fresh and from-plan applies."""
+    """
+    Shared confirm + delete + summary for both fresh and from-plan applies.
+
+    Returns the apply_deletions stats dict, or None if the user aborted at the
+    confirmation prompt (so callers can distinguish "nothing happened" from a
+    completed apply when choosing an exit code).
+    """
     total_files = sum(len(item['deletes']) for item in plan)
     total_reclaim = sum(item['size'] * len(item['deletes']) for item in plan)
 
@@ -1425,7 +1527,7 @@ def _confirm_and_apply(plan, args):
             answer = ''
         if answer not in ('y', 'yes'):
             print("Aborted. Nothing deleted.")
-            return
+            return None
 
     stats = apply_deletions(plan, verify=args.verify,
                             show_progress=not args.no_progress)
@@ -1434,14 +1536,21 @@ def _confirm_and_apply(plan, args):
     print("  Failed:    {0}".format(stats['failed']))
     print("  Reclaimed: {0} ({1})".format(
         stats['reclaimed'], human_readable_size(stats['reclaimed'])))
+    return stats
 
 
 def run_deletion(duplicates, args):
-    """Build a deletion plan and either preview (saving it), export, or apply it."""
+    """
+    Build a deletion plan and either preview (saving it), export, or apply it.
+
+    Returns the apply stats dict when --apply actually deleted (so main() can
+    base its exit code on the failure count), else None (dry run / script export
+    / nothing to delete / aborted).
+    """
     plan = plan_deletions(duplicates, args.keep)
     if not plan:
         print("\nNothing to delete (every group has only one copy).")
-        return
+        return None
 
     print(format_deletion_plan(plan, args.keep))
 
@@ -1453,7 +1562,7 @@ def run_deletion(duplicates, args):
             print("Review it, then run:  sh {0}".format(args.delete_script))
         except (IOError, OSError) as e:
             print("Error writing script: {0}".format(e), file=sys.stderr)
-        return
+        return None
 
     # Mode 2: actually delete. Save the plan first if explicitly requested.
     if args.apply:
@@ -1463,8 +1572,7 @@ def run_deletion(duplicates, args):
                 print("\nPlan saved to: {0}".format(args.save_plan))
             except (IOError, OSError) as e:
                 print("Warning: could not save plan: {0}".format(e), file=sys.stderr)
-        _confirm_and_apply(plan, args)
-        return
+        return _confirm_and_apply(plan, args)
 
     # Mode 3: dry run — save the plan so --apply can reuse it without re-scanning.
     plan_path = args.save_plan
@@ -1485,7 +1593,12 @@ def run_deletion(duplicates, args):
 
 
 def apply_from_plan(args):
-    """Load a saved JSON plan and preview or apply it, with no scanning."""
+    """
+    Load a saved JSON plan and preview or apply it, with no scanning.
+
+    Returns the apply stats dict when --apply actually deleted, else None
+    (dry-run preview or aborted), so main() can set the exit code accordingly.
+    """
     try:
         groups, meta = load_plan(args.from_plan)
     except (IOError, OSError) as e:
@@ -1505,13 +1618,13 @@ def apply_from_plan(args):
 
     if not args.apply:
         print("\nDRY RUN — nothing deleted. Re-run with --apply to delete.")
-        return
+        return None
 
     if not args.verify:
         print("\nNote: applying a saved plan without --verify. If files may have "
               "changed since the plan was made, re-run with --verify.",
               file=sys.stderr)
-    _confirm_and_apply(groups, args)
+    return _confirm_and_apply(groups, args)
 
 
 if __name__ == '__main__':
