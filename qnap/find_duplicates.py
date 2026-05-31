@@ -442,6 +442,26 @@ class DuplicateFinder(object):
         self.scan_pass2_seconds = t_end - t_pass1
         self.scan_total_seconds = t_end - t0
 
+    @staticmethod
+    def _await_threads(threads):
+        """
+        Join worker threads while staying responsive to Ctrl+C.
+
+        A bare Thread.join()/Queue.join() with no timeout is UNINTERRUPTIBLE on
+        Python 2: the main thread parks in a C lock acquire and CPython only
+        raises KeyboardInterrupt in the main thread between bytecodes, so the
+        signal can't fire until the join returns. Polling with a short timeout
+        keeps returning to the bytecode loop (the underlying time.sleep takes
+        the signal), so Ctrl+C is delivered within ~one tick. Workers are daemon
+        threads, so a propagating KeyboardInterrupt tears them down at exit.
+        """
+        while True:
+            alive = [t for t in threads if t.is_alive()]
+            if not alive:
+                return
+            for t in alive:
+                t.join(0.2)
+
     def _parallel_walk(self, base_paths, merge_batch, worker_count):
         """
         Walk base_paths with a pool of worker_count threads.
@@ -557,11 +577,20 @@ class DuplicateFinder(object):
             t.daemon = True
             t.start()
 
-        work.join()                      # all dirs (incl. discovered) processed
+        # Wait for every dir (including ones discovered mid-walk) to finish.
+        # Queue.join() has no timeout and is uninterruptible on Python 2, so run
+        # it in a daemon thread and poll an Event with a timeout instead -- that
+        # keeps Ctrl+C responsive (see _await_threads).
+        finished = threading.Event()
+        waiter = threading.Thread(target=lambda: (work.join(), finished.set()))
+        waiter.daemon = True
+        waiter.start()
+        while not finished.wait(0.2):
+            pass
+
         for _ in range(n):
             work.put(sentinel)           # wake the blocked workers so they exit
-        for t in threads:
-            t.join()
+        self._await_threads(threads)
 
     def _parallel_hash(self, filepaths, hash_fn, label):
         """
@@ -615,8 +644,7 @@ class DuplicateFinder(object):
         for t in threads:
             t.daemon = True
             t.start()
-        for t in threads:
-            t.join()
+        self._await_threads(threads)  # interruptible join (responsive to Ctrl+C)
 
         self.files_skipped_error += state['errors']
         return results
@@ -1446,4 +1474,11 @@ def apply_from_plan(args):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Scan/hash run in daemon threads, so they're torn down on exit. The
+        # scan and dry-run phases touch nothing on disk; only --apply deletes,
+        # and that runs single-threaded in the main thread.
+        print("\nInterrupted by user (Ctrl+C). Aborting.", file=sys.stderr)
+        sys.exit(130)
