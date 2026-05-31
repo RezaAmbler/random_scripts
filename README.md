@@ -5,7 +5,7 @@ A personal collection of standalone scripts, organized into folders by category.
 ## Categories
 
 - **`qnap/`** — Scripts for the QNAP NAS.
-  - `find_duplicates.py` — find duplicate files by size + MD5, with optional safe deletion (Python 2.7).
+  - `find_duplicates.py` — find duplicate files by size + MD5 (parallel scan + hashing), with optional safe deletion (Python 2.7).
 - **`network/`** — Networking and routing diagnostics.
   - `router-views-lookup-mass.py` — BGP prefix visibility checker across route servers.
   - `whois-checker.py` — WHOIS lookup + parsing for IP prefixes.

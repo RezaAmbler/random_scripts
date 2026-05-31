@@ -22,6 +22,9 @@ USAGE EXAMPLES:
     # Speed up hashing on an idle multi-disk array (default 4 threads)
     python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --workers 8
 
+    # Speed up the directory scan itself (parallel stat walk, default 8 threads)
+    python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --scan-workers 16
+
     # Include QNAP metadata directories (normally skipped)
     python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --include-metadata
 
@@ -47,6 +50,7 @@ import sys
 import argparse
 import hashlib
 import json
+import stat
 import time
 import threading
 from collections import defaultdict
@@ -95,6 +99,17 @@ def human_readable_size(size_bytes):
         size_bytes /= 1024.0
 
     return "{0:.2f} PB".format(size_bytes)
+
+
+def human_readable_duration(seconds):
+    """Format a duration as e.g. '4.20s', '2m 05s', or '1h 02m 03s'."""
+    if seconds < 60:
+        return "{0:.2f}s".format(seconds)
+    total = int(seconds)
+    if total < 3600:
+        return "{0}m {1:02d}s".format(total // 60, total % 60)
+    return "{0}h {1:02d}m {2:02d}s".format(
+        total // 3600, (total % 3600) // 60, total % 60)
 
 
 def should_skip_dir(dirname, include_metadata=False):
@@ -229,12 +244,13 @@ class DuplicateFinder(object):
 
     def __init__(self, min_size=DEFAULT_MIN_SIZE, include_metadata=False,
                  follow_symlinks=False, verbose=False, show_progress=True,
-                 workers=1):
+                 workers=1, scan_workers=8):
         self.min_size = min_size
         self.include_metadata = include_metadata
         self.follow_symlinks = follow_symlinks
         self.verbose = verbose
-        self.workers = max(1, workers)
+        self.workers = max(1, workers)            # hashing threads
+        self.scan_workers = max(1, scan_workers)  # directory-walk threads
         self.progress = ProgressDisplay(enabled=show_progress)
 
         # Statistics
@@ -246,6 +262,11 @@ class DuplicateFinder(object):
         self.dirs_scanned = 0
         self.dirs_skipped = 0
         self._candidates_collected = 0
+
+        # Wall-clock time of the scan phase (set by scan_directories).
+        self.scan_pass1_seconds = 0.0
+        self.scan_pass2_seconds = 0.0
+        self.scan_total_seconds = 0.0
 
         # Phase 1 runs in two passes (see scan_directories). The first pass
         # only tallies a {size: count} table; the second keeps paths for the
@@ -326,15 +347,49 @@ class DuplicateFinder(object):
         matters on a NAS with limited RAM and very large trees. The cost is a
         second metadata (stat) walk, which is cheap next to the hashing phase
         that follows.
+
+        Both passes use _parallel_walk: the tree is walked by self.scan_workers
+        threads, which overlaps the per-entry stat/listdir seek latency that
+        otherwise leaves a NAS array idle. Per-directory results are merged into
+        the shared tallies single-threaded under one lock. The result is
+        deterministic and independent of worker count / thread scheduling: a
+        file reachable by several paths (hardlinks, or symlinks under
+        --follow-symlinks) is represented by its lexicographically smallest
+        path (see pass 2 below).
         """
         valid_paths = self._valid_paths(paths)
 
-        # --- Pass 1: count files per size ---------------------------------
+        t0 = time.time()
+
+        # --- Pass 1: count files per size (parallel walk) -----------------
+        self.log("Scanning (pass 1/2): {0}".format(", ".join(valid_paths)))
         size_counts = defaultdict(int)
-        for base_path in valid_paths:
-            self.log("Scanning (pass 1/2): {0}".format(base_path))
-            self._count_sizes(base_path, size_counts)
+
+        def pass1_merge(dirpath, file_entries, dirs_skipped, errors):
+            # Runs under the walk lock: the only place pass-1 stats mutate.
+            self.dirs_scanned += 1
+            self.dirs_skipped += dirs_skipped
+            self.files_skipped_error += errors
+            for filepath, file_size, inode_key in file_entries:
+                if file_size < self.min_size:
+                    self.files_skipped_size += 1
+                    continue
+                # Inode de-dup: decided here (under the lock) so concurrent
+                # workers can't both record the same inode.
+                if inode_key is not None:
+                    if inode_key in self._seen_inodes:
+                        self.files_skipped_inode += 1
+                        continue
+                    self._seen_inodes.add(inode_key)
+                self.total_files_scanned += 1
+                self.total_bytes_scanned += file_size
+                size_counts[file_size] += 1
+            self._update_scan_progress(dirpath)
+
+        self._parallel_walk(valid_paths, pass1_merge, self.scan_workers)
         self.progress.clear()
+        t_pass1 = time.time()
+        self.scan_pass1_seconds = t_pass1 - t0
 
         self.unique_sizes = len(size_counts)
         candidate_sizes = set(size for size, n in size_counts.items() if n > 1)
@@ -344,111 +399,169 @@ class DuplicateFinder(object):
         self._seen_inodes = set()
 
         if not candidate_sizes:
+            self.scan_pass2_seconds = 0.0
+            self.scan_total_seconds = time.time() - t0
             return
 
-        # --- Pass 2: collect paths for colliding sizes only ---------------
+        # --- Pass 2: collect paths for colliding sizes only (parallel) ----
+        self.log("Scanning (pass 2/2): {0}".format(", ".join(valid_paths)))
         self._candidates_collected = 0
-        for base_path in valid_paths:
-            self.log("Scanning (pass 2/2): {0}".format(base_path))
-            self._collect_paths(base_path, candidate_sizes)
-        self.progress.clear()
+        # inode_key -> index of its path within size_groups[size]. Lets us keep
+        # the lexicographically smallest path when one inode is reachable by
+        # several paths, so the collected set is deterministic regardless of
+        # which worker thread reached it first.
+        inode_index = {}
 
-    def _count_sizes(self, base_path, size_counts):
-        """Pass 1: tally a {size: count} table; store no path strings."""
-        for root, dirs, files in os.walk(base_path,
-                                          followlinks=self.follow_symlinks):
-            self.dirs_scanned += 1
-            self._update_scan_progress(root)
-
-            # Filter out directories we should skip (modifies in-place)
-            original_dir_count = len(dirs)
-            dirs[:] = [d for d in dirs
-                       if not should_skip_dir(d, self.include_metadata)]
-            self.dirs_skipped += original_dir_count - len(dirs)
-
-            for filename in files:
-                filepath = os.path.join(root, filename)
-
-                # Skip symlinks unless explicitly following them
-                if not self.follow_symlinks and os.path.islink(filepath):
+        def pass2_merge(dirpath, file_entries, dirs_skipped, errors):
+            # Runs under the walk lock. Deliberately does NOT touch the pass-1
+            # counters (dirs_scanned, files_skipped_*, total_*) -- those were
+            # finalised in pass 1; re-counting here would double them.
+            for filepath, file_size, inode_key in file_entries:
+                if file_size not in candidate_sizes:
                     continue
-
-                try:
-                    stat_info = os.stat(filepath)
-                    file_size = stat_info.st_size
-
-                    # Skip files below minimum size
-                    if file_size < self.min_size:
-                        self.files_skipped_size += 1
-                        continue
-
-                    # Inode de-duplication. st_ino == 0 means the filesystem
-                    # does not report a usable inode number, so fall back to
-                    # treating the path as unique rather than collapsing
-                    # unrelated files together.
-                    if stat_info.st_ino != 0:
-                        inode_key = (stat_info.st_dev, stat_info.st_ino)
-                        if inode_key in self._seen_inodes:
-                            self.files_skipped_inode += 1
-                            continue
-                        self._seen_inodes.add(inode_key)
-
-                    self.total_files_scanned += 1
-                    self.total_bytes_scanned += file_size
-                    size_counts[file_size] += 1
-
-                    if self.total_files_scanned % 50 == 0:
-                        self._update_scan_progress(root)
-
-                except (OSError, IOError):
-                    self.files_skipped_error += 1
-
-    def _collect_paths(self, base_path, candidate_sizes):
-        """
-        Pass 2: walk again and keep paths only for sizes that occurred more
-        than once in pass 1. Inode de-duplication is repeated here (against a
-        fresh set) so hardlinks and overlapping inputs still collapse to a
-        single path -- consistently with the pass-1 tally.
-        """
-        seen = self._seen_inodes
-        for root, dirs, files in os.walk(base_path,
-                                         followlinks=self.follow_symlinks):
-            self._update_collect_progress(root, self._candidates_collected)
-
-            dirs[:] = [d for d in dirs
-                       if not should_skip_dir(d, self.include_metadata)]
-
-            for filename in files:
-                filepath = os.path.join(root, filename)
-
-                if not self.follow_symlinks and os.path.islink(filepath):
-                    continue
-
-                try:
-                    stat_info = os.stat(filepath)
-                    file_size = stat_info.st_size
-
-                    # Only files whose size collided in pass 1 can be dupes.
-                    if file_size not in candidate_sizes:
-                        continue
-
-                    if stat_info.st_ino != 0:
-                        inode_key = (stat_info.st_dev, stat_info.st_ino)
-                        if inode_key in seen:
-                            continue
-                        seen.add(inode_key)
-
+                if inode_key is None:
+                    # No usable inode number -> can't dedup; keep every path.
                     self.size_groups[file_size].append(filepath)
                     self._candidates_collected += 1
+                    continue
+                if inode_key in inode_index:
+                    # Same inode via another path (hardlink, or a symlink under
+                    # --follow-symlinks): keep the smallest path deterministically.
+                    idx = inode_index[inode_key]
+                    if filepath < self.size_groups[file_size][idx]:
+                        self.size_groups[file_size][idx] = filepath
+                    continue
+                self.size_groups[file_size].append(filepath)
+                inode_index[inode_key] = len(self.size_groups[file_size]) - 1
+                self._candidates_collected += 1
+            self._update_collect_progress(dirpath, self._candidates_collected)
 
-                    if self._candidates_collected % 50 == 0:
-                        self._update_collect_progress(
-                            root, self._candidates_collected)
+        self._parallel_walk(valid_paths, pass2_merge, self.scan_workers)
+        self.progress.clear()
+        t_end = time.time()
+        self.scan_pass2_seconds = t_end - t_pass1
+        self.scan_total_seconds = t_end - t0
 
+    def _parallel_walk(self, base_paths, merge_batch, worker_count):
+        """
+        Walk base_paths with a pool of worker_count threads.
+
+        Each worker pops a directory off a shared queue, lists it and stats its
+        entries WITHOUT holding any lock (this is the seek-bound part we want to
+        overlap), then calls merge_batch(dirpath, file_entries, dirs_skipped,
+        errors) once for that directory while holding a single shared lock.
+        file_entries is a list of (filepath, size, inode_key) where inode_key is
+        (st_dev, st_ino) or None when the fs reports no usable inode.
+
+        Subdirectories discovered are pushed back onto the queue, so the work
+        set grows as the walk descends. Termination therefore relies on
+        Queue.join()/task_done() (NOT get_nowait()/Empty, which would race with
+        a worker that is about to enqueue children): join() returns only once
+        every enqueued directory -- including ones discovered mid-walk -- has
+        been processed, after which sentinels wake the blocked workers.
+
+        Symlink/skip semantics match the previous os.walk: with follow_symlinks
+        off, symlinks are skipped entirely; with it on, a symlinked dir is
+        descended and a symlinked file is stat'd through to its target (so size
+        and inode come from the target). No symlink-loop detection -- same as
+        os.walk(followlinks=True).
+
+        Memory: the queue holds pending directory PATH strings (frontier
+        breadth), not files, so it does not change the two-pass memory bound.
+        """
+        work = Queue()
+        for base in base_paths:
+            work.put(base)
+
+        lock = threading.Lock()
+        sentinel = object()
+
+        def process_dir(dirpath):
+            try:
+                names = os.listdir(dirpath)
+            except (OSError, IOError):
+                # Unlistable dir: like os.walk's default onerror, it yields
+                # nothing and is not counted as scanned.
+                return
+
+            subdirs = []
+            file_entries = []
+            dirs_skipped = 0
+            errors = 0
+
+            for name in names:
+                full = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(full)
                 except (OSError, IOError):
-                    # A file that errors here simply isn't collected; if it was
-                    # countable in pass 1 its group just loses one candidate.
-                    pass
+                    errors += 1
+                    continue
+                mode = st.st_mode
+
+                if stat.S_ISLNK(mode):
+                    if not self.follow_symlinks:
+                        continue  # skip symlinks entirely
+                    # Following: resolve to the target for classification,
+                    # size and inode (matches the old os.stat behaviour).
+                    try:
+                        st = os.stat(full)
+                    except (OSError, IOError):
+                        errors += 1
+                        continue
+                    mode = st.st_mode
+                    if stat.S_ISDIR(mode):
+                        if should_skip_dir(name, self.include_metadata):
+                            dirs_skipped += 1
+                        else:
+                            subdirs.append(full)
+                        continue
+                    # else: a symlink to a file -> fall through to file handling
+                elif stat.S_ISDIR(mode):
+                    if should_skip_dir(name, self.include_metadata):
+                        dirs_skipped += 1
+                    else:
+                        subdirs.append(full)
+                    continue
+
+                # Regular file (or followed symlink to a non-dir, or a
+                # fifo/socket/device -- os.walk listed those as files too).
+                inode_key = None
+                if st.st_ino != 0:
+                    inode_key = (st.st_dev, st.st_ino)
+                file_entries.append((full, st.st_size, inode_key))
+
+            with lock:
+                merge_batch(dirpath, file_entries, dirs_skipped, errors)
+
+            # Queue is thread-safe; enqueue children AFTER the merge but BEFORE
+            # this dir's task_done (in the worker) so join() can't finish early.
+            for child in subdirs:
+                work.put(child)
+
+        def worker():
+            while True:
+                item = work.get()
+                if item is sentinel:
+                    work.task_done()
+                    return
+                try:
+                    process_dir(item)
+                except (OSError, IOError):
+                    pass  # one bad directory must not kill the worker
+                finally:
+                    work.task_done()
+
+        n = max(1, worker_count)  # do NOT cap by len(base_paths); work fans out
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        for t in threads:
+            t.daemon = True
+            t.start()
+
+        work.join()                      # all dirs (incl. discovered) processed
+        for _ in range(n):
+            work.put(sentinel)           # wake the blocked workers so they exit
+        for t in threads:
+            t.join()
 
     def _parallel_hash(self, filepaths, hash_fn, label):
         """
@@ -549,6 +662,10 @@ class DuplicateFinder(object):
         print("  Candidate files (max):      {0}".format(upper_bound_files))
         print("  Data to read (max):         {0}".format(
             human_readable_size(upper_bound_bytes)))
+        print("  Scan time (walk):           {0}  (pass 1: {1}, pass 2: {2})".format(
+            human_readable_duration(self.scan_total_seconds),
+            human_readable_duration(self.scan_pass1_seconds),
+            human_readable_duration(self.scan_pass2_seconds)))
         print("-" * 50)
         print("")
 
@@ -1055,6 +1172,17 @@ Examples:
     )
 
     parser.add_argument(
+        '--scan-workers',
+        type=int,
+        default=8,
+        metavar='N',
+        help='Number of parallel threads for the directory-scan/stat walk '
+             '(default: 8). The scan is metadata-bound (stat/listdir latency), '
+             'not bandwidth-bound, so it tolerates more concurrency than '
+             '--workers; raise it (e.g. 16) on an idle multi-disk array.'
+    )
+
+    parser.add_argument(
         '--include-metadata',
         action='store_true',
         help='Include QNAP metadata directories (starting with @)'
@@ -1174,7 +1302,8 @@ def main():
         follow_symlinks=args.follow_symlinks,
         verbose=args.verbose,
         show_progress=not args.no_progress,
-        workers=args.workers
+        workers=args.workers,
+        scan_workers=args.scan_workers
     )
 
     print("Starting scan...")

@@ -18,10 +18,18 @@ python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia
 python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia /share/CACHEDEV1_DATA/Download -o report.txt
 ```
 
+Both phases are multithreaded and the I/O is latency-bound, so on an idle
+multi-disk array more threads = faster: `--workers N` (hashing, default 4) and
+`--scan-workers N` (the directory/stat walk, default 8). The walk is metadata-
+bound so it tolerates higher concurrency than hashing; the scan's wall-clock
+time is printed in the summary. Use `--workers 1` for a single spinning disk
+where parallel reads thrash. Memory stays bounded regardless of tree size (the
+scan tallies sizes first, then keeps paths only for size-colliding candidates).
+
 Exit codes: `0` = no duplicates (or `--zero-exit`), `1` = duplicates found
 (handy as a cron signal), `2` = no valid paths. See the script's header docstring
 for the full option list (`--min-size`, `--include-metadata`, `--follow-symlinks`,
-`--verbose`, `--no-progress`).
+`--verbose`, `--no-progress`, `--workers`, `--scan-workers`).
 
 #### Deleting duplicates
 By default the script only reports. Add `--delete` to plan removals — it keeps
