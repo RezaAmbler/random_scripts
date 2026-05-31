@@ -19,6 +19,9 @@ USAGE EXAMPLES:
     # Change minimum file size (default 1MB)
     python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --min-size 10485760
 
+    # Speed up hashing on an idle multi-disk array (default 4 threads)
+    python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --workers 8
+
     # Include QNAP metadata directories (normally skipped)
     python find_duplicates.py /share/CACHEDEV1_DATA/Multimedia --include-metadata
 
@@ -45,7 +48,15 @@ import argparse
 import hashlib
 import json
 import time
+import threading
 from collections import defaultdict
+
+# Queue moved/renamed between Python 2 and 3. Used to feed the hashing thread
+# pool below.
+try:
+    from Queue import Queue, Empty  # Python 2
+except ImportError:
+    from queue import Queue, Empty  # Python 3
 
 # raw_input was renamed to input in Python 3. Keep the 2.7 name working while
 # also letting the script run unmodified under Python 3 (used for testing the
@@ -217,11 +228,13 @@ class DuplicateFinder(object):
     """Finds duplicate files using size-first, then hash approach."""
 
     def __init__(self, min_size=DEFAULT_MIN_SIZE, include_metadata=False,
-                 follow_symlinks=False, verbose=False, show_progress=True):
+                 follow_symlinks=False, verbose=False, show_progress=True,
+                 workers=1):
         self.min_size = min_size
         self.include_metadata = include_metadata
         self.follow_symlinks = follow_symlinks
         self.verbose = verbose
+        self.workers = max(1, workers)
         self.progress = ProgressDisplay(enabled=show_progress)
 
         # Statistics
@@ -247,8 +260,8 @@ class DuplicateFinder(object):
         # idempotent across overlapping input paths (e.g. /a and /a/b given
         # together) and prevents hardlinks to the same inode from being
         # reported as reclaimable duplicates -- deleting one frees nothing.
-        # Reset between the two passes: pass 1 dedups for the tally, pass 2
-        # dedups again while collecting paths.
+        # Reset between passes: pass 1 dedups for the tally, pass 2 dedups
+        # again while collecting paths.
         self._seen_inodes = set()
 
     def log(self, message):
@@ -437,6 +450,64 @@ class DuplicateFinder(object):
                     # countable in pass 1 its group just loses one candidate.
                     pass
 
+    def _parallel_hash(self, filepaths, hash_fn, label):
+        """
+        Hash every path in `filepaths` with a pool of self.workers threads.
+
+        hash_fn(filepath) -> hex digest, or None if the file can't be read.
+        Returns a {filepath: digest} dict; unreadable files are omitted and
+        counted into files_skipped_error.
+
+        The work is I/O-bound and both file reads and hashlib.update() (on our
+        1 MB / 64 KB buffers) release the GIL, so threads genuinely overlap the
+        per-file seek latency that otherwise leaves a multi-disk array idle.
+        Grouping the results stays single-threaded in the caller, so nothing
+        that decides what gets deleted runs concurrently.
+        """
+        results = {}
+        total = len(filepaths)
+        if total == 0:
+            return results
+
+        work = Queue()
+        for fp in filepaths:
+            work.put(fp)
+
+        lock = threading.Lock()
+        state = {'done': 0, 'errors': 0}
+
+        def worker():
+            while True:
+                try:
+                    fp = work.get_nowait()
+                except Empty:
+                    return
+                digest = hash_fn(fp)
+                # Guard shared state AND the progress line (ProgressDisplay is
+                # not thread-safe); the write is throttled so this is cheap.
+                with lock:
+                    state['done'] += 1
+                    if digest is None:
+                        state['errors'] += 1
+                    else:
+                        results[fp] = digest
+                    name = os.path.basename(fp)
+                    if len(name) > 30:
+                        name = name[:27] + '...'
+                    self.progress.update("{0} {1}/{2} | {3}".format(
+                        label, state['done'], total, name))
+
+        n = max(1, min(self.workers, total))
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        for t in threads:
+            t.daemon = True
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.files_skipped_error += state['errors']
+        return results
+
     def find_duplicates(self):
         """
         Phase 2: Find duplicates by computing hashes for size-matched files.
@@ -488,45 +559,34 @@ class DuplicateFinder(object):
         # ------------------------------------------------------------------
         # Phase 2a: pre-filter with a cheap head+tail partial hash.
         #
-        # We build the definitive list of files that still need a full hash
-        # FIRST, so the progress denominators below are accurate. The original
-        # computed them from the full size-group counts, so the percentage and
-        # the "File N/total" counter never reached 100% whenever the pre-filter
-        # eliminated anything.
+        # Hash every file in a >2-member group in parallel, then regroup by
+        # partial digest (single-threaded). Groups of exactly 2 skip the
+        # pre-filter -- it can never eliminate anything -- and go straight to
+        # the full hash.
         # ------------------------------------------------------------------
-        candidate_groups = []  # list of (size, [filepaths sharing a partial hash])
+        prefilter_targets = []
+        for size, filepaths in size_groups_to_check:
+            if len(filepaths) > 2:
+                prefilter_targets.extend(filepaths)
 
+        partial_hashes = self._parallel_hash(
+            prefilter_targets, compute_partial_md5, "[Pre-filter]")
+
+        candidate_groups = []  # list of (size, [filepaths sharing a partial hash])
         for size, filepaths in size_groups_to_check:
             if len(filepaths) > 2:
                 partial_groups = defaultdict(list)
-                for idx, fp in enumerate(filepaths):
-                    display_fp = os.path.basename(fp)
-                    if len(display_fp) > 30:
-                        display_fp = display_fp[:27] + '...'
-                    msg = "[Pre-filter] Group size {0} | {1}/{2} | {3}".format(
-                        human_readable_size(size),
-                        idx + 1,
-                        len(filepaths),
-                        display_fp
-                    )
-                    self.progress.update(msg)
-
-                    partial = compute_partial_md5(fp)
-                    if partial is not None:
-                        partial_groups[partial].append(fp)
-                    else:
-                        self.files_skipped_error += 1
-
+                for fp in filepaths:
+                    digest = partial_hashes.get(fp)
+                    if digest is not None:
+                        partial_groups[digest].append(fp)
                 for fps in partial_groups.values():
                     if len(fps) > 1:
                         candidate_groups.append((size, fps))
             else:
                 candidate_groups.append((size, filepaths))
 
-        # Accurate denominators for the full-hash pass.
         files_to_hash = sum(len(fps) for _, fps in candidate_groups)
-        total_bytes_to_hash = sum(size * len(fps)
-                                  for size, fps in candidate_groups)
 
         self.progress.clear()
         self.log("Pre-filter survivors: {0} files in {1} groups".format(
@@ -537,58 +597,21 @@ class DuplicateFinder(object):
             return duplicates
 
         # ------------------------------------------------------------------
-        # Phase 2b: full MD5 hash of the survivors.
+        # Phase 2b: full MD5 hash of the survivors, in parallel, then group
+        # by digest (single-threaded) so only the I/O fans out.
         # ------------------------------------------------------------------
-        hashed_count = 0
-        bytes_hashed = 0
+        full_targets = []
+        for size, filepaths in candidate_groups:
+            full_targets.extend(filepaths)
+
+        full_hashes = self._parallel_hash(full_targets, compute_md5, "[Hash]")
 
         for size, filepaths in candidate_groups:
             hash_groups = defaultdict(list)
             for fp in filepaths:
-                hashed_count += 1
-
-                # Shorten filepath for display
-                display_fp = os.path.basename(fp)
-                if len(display_fp) > 25:
-                    display_fp = display_fp[:22] + '...'
-
-                # Create progress callback for this file
-                def make_hash_progress(file_num, total_files, filename,
-                                        prev_bytes, total_bytes_all):
-                    def callback(bytes_read, file_total):
-                        current_total = prev_bytes + bytes_read
-                        pct = (current_total * 100) // total_bytes_all if total_bytes_all > 0 else 0
-                        file_pct = (bytes_read * 100) // file_total if file_total > 0 else 100
-
-                        msg = "[Hash] {0}% | File {1}/{2}: {3}% | {4}".format(
-                            pct,
-                            file_num,
-                            total_files,
-                            file_pct,
-                            filename
-                        )
-                        self.progress.update(msg)
-                    return callback
-
-                progress_cb = make_hash_progress(
-                    hashed_count, files_to_hash, display_fp,
-                    bytes_hashed, total_bytes_to_hash
-                )
-
-                # Show initial progress for this file
-                msg = "[Hash] {0}% | File {1}/{2}: 0% | {3}".format(
-                    (bytes_hashed * 100) // total_bytes_to_hash if total_bytes_to_hash > 0 else 0,
-                    hashed_count,
-                    files_to_hash,
-                    display_fp
-                )
-                self.progress.update(msg, force=True)
-
-                file_hash = compute_md5(fp, progress_callback=progress_cb)
-                bytes_hashed += size
-
-                if file_hash:
-                    hash_groups[file_hash].append(fp)
+                digest = full_hashes.get(fp)
+                if digest:
+                    hash_groups[digest].append(fp)
 
             # Collect groups with actual duplicates
             for file_hash, fps in hash_groups.items():
@@ -1021,6 +1044,17 @@ Examples:
     )
 
     parser.add_argument(
+        '-j', '--workers',
+        type=int,
+        default=4,
+        metavar='N',
+        help='Number of parallel hashing threads (default: 4). Hashing is '
+             'I/O-bound; on an idle multi-disk array, 4-8 overlaps seek '
+             'latency and speeds things up. Use 1 for a single spinning disk '
+             'where parallel reads cause seek thrashing.'
+    )
+
+    parser.add_argument(
         '--include-metadata',
         action='store_true',
         help='Include QNAP metadata directories (starting with @)'
@@ -1139,7 +1173,8 @@ def main():
         include_metadata=args.include_metadata,
         follow_symlinks=args.follow_symlinks,
         verbose=args.verbose,
-        show_progress=not args.no_progress
+        show_progress=not args.no_progress,
+        workers=args.workers
     )
 
     print("Starting scan...")
