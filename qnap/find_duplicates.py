@@ -263,10 +263,12 @@ class DuplicateFinder(object):
         self.dirs_skipped = 0
         self._candidates_collected = 0
 
-        # Wall-clock time of the scan phase (set by scan_directories).
+        # Wall-clock time of each phase (set by scan_directories/find_duplicates).
         self.scan_pass1_seconds = 0.0
         self.scan_pass2_seconds = 0.0
         self.scan_total_seconds = 0.0
+        self.prefilter_seconds = 0.0
+        self.hash_seconds = 0.0
 
         # Phase 1 runs in two passes (see scan_directories). The first pass
         # only tallies a {size: count} table; the second keeps paths for the
@@ -592,13 +594,19 @@ class DuplicateFinder(object):
             work.put(sentinel)           # wake the blocked workers so they exit
         self._await_threads(threads)
 
-    def _parallel_hash(self, filepaths, hash_fn, label):
+    def _parallel_hash(self, filepaths, hash_fn, label, worker_count=None):
         """
-        Hash every path in `filepaths` with a pool of self.workers threads.
+        Hash every path in `filepaths` with a pool of `worker_count` threads
+        (default self.workers).
 
         hash_fn(filepath) -> hex digest, or None if the file can't be read.
         Returns a {filepath: digest} dict; unreadable files are omitted and
         counted into files_skipped_error.
+
+        The two callers use different pool sizes on purpose: the pre-filter does
+        many small random head+tail reads and wants a deep queue (self.scan_
+        workers), while the full hash does large sequential reads that thrash a
+        spinning array if too many run at once (self.workers / -j, kept low).
 
         The work is I/O-bound and both file reads and hashlib.update() (on our
         1 MB / 64 KB buffers) release the GIL, so threads genuinely overlap the
@@ -639,7 +647,8 @@ class DuplicateFinder(object):
                     self.progress.update("{0} {1}/{2} | {3}".format(
                         label, state['done'], total, name))
 
-        n = max(1, min(self.workers, total))
+        wc = self.workers if worker_count is None else worker_count
+        n = max(1, min(wc, total))
         threads = [threading.Thread(target=worker) for _ in range(n)]
         for t in threads:
             t.daemon = True
@@ -714,8 +723,13 @@ class DuplicateFinder(object):
             if len(filepaths) > 2:
                 prefilter_targets.extend(filepaths)
 
+        # Pre-filter reads are small and random (head+tail of scattered files),
+        # so drive them with the metadata pool (scan_workers) for queue depth --
+        # NOT the low -j meant for big sequential reads.
+        t_pf0 = time.time()
         partial_hashes = self._parallel_hash(
-            prefilter_targets, compute_partial_md5, "[Pre-filter]")
+            prefilter_targets, compute_partial_md5, "[Pre-filter]",
+            worker_count=self.scan_workers)
 
         candidate_groups = []  # list of (size, [filepaths sharing a partial hash])
         for size, filepaths in size_groups_to_check:
@@ -730,12 +744,29 @@ class DuplicateFinder(object):
                         candidate_groups.append((size, fps))
             else:
                 candidate_groups.append((size, filepaths))
+        self.prefilter_seconds = time.time() - t_pf0
 
         files_to_hash = sum(len(fps) for _, fps in candidate_groups)
+        total_bytes_to_hash = sum(size * len(fps)
+                                  for size, fps in candidate_groups)
 
+        # Pre-filter findings + timing (mirrors the SCAN COMPLETE block).
         self.progress.clear()
-        self.log("Pre-filter survivors: {0} files in {1} groups".format(
+        print("")
+        print("-" * 50)
+        print("PRE-FILTER COMPLETE - head+tail partial hash")
+        print("-" * 50)
+        print("  Files checked (head+tail):  {0}".format(len(prefilter_targets)))
+        print("  Eliminated by pre-filter:   {0}".format(
+            upper_bound_files - files_to_hash))
+        print("  Survivors to full hash:     {0} in {1} groups".format(
             files_to_hash, len(candidate_groups)))
+        print("  Data to full-hash:          {0}".format(
+            human_readable_size(total_bytes_to_hash)))
+        print("  Pre-filter time:            {0}  ({1} threads)".format(
+            human_readable_duration(self.prefilter_seconds), self.scan_workers))
+        print("-" * 50)
+        print("")
 
         if files_to_hash == 0:
             print("No duplicates survived pre-filtering.")
@@ -743,13 +774,17 @@ class DuplicateFinder(object):
 
         # ------------------------------------------------------------------
         # Phase 2b: full MD5 hash of the survivors, in parallel, then group
-        # by digest (single-threaded) so only the I/O fans out.
+        # by digest (single-threaded) so only the I/O fans out. These are large
+        # sequential reads -- self.workers (-j) stays low so concurrent streams
+        # don't make a spinning array seek-thrash.
         # ------------------------------------------------------------------
         full_targets = []
         for size, filepaths in candidate_groups:
             full_targets.extend(filepaths)
 
+        t_h0 = time.time()
         full_hashes = self._parallel_hash(full_targets, compute_md5, "[Hash]")
+        self.hash_seconds = time.time() - t_h0
 
         for size, filepaths in candidate_groups:
             hash_groups = defaultdict(list)
@@ -808,6 +843,12 @@ def format_report(finder, duplicates):
         finder.files_skipped_error))
     lines.append("  Directories skipped:    {0}".format(
         finder.dirs_skipped))
+    lines.append("  Scan time (walk):       {0}".format(
+        human_readable_duration(finder.scan_total_seconds)))
+    lines.append("  Pre-filter time:        {0}".format(
+        human_readable_duration(finder.prefilter_seconds)))
+    lines.append("  Full-hash time:         {0}".format(
+        human_readable_duration(finder.hash_seconds)))
     lines.append("")
 
     # Duplicate summary
